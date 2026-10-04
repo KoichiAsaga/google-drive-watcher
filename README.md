@@ -11,6 +11,8 @@
 1. Google Driveの監視したいディレクトリのIDとGoogle Chatの対象のスペースIDを.envに記載！
 1. OAthでそれぞれのAPI叩くんでOathクライアントの追加も忘れずに
 1. あとデータベースの名前を.envで指定しておくこと。FireStoreに更新があったファイルとか保存します
+1. cron実行でフォルダの変更点をgoogle chatに通知するのでcloude scheduleも良い感じに設定しておくこと。変更点の蓄積はwebhookなのだけれども
+1. cronで叩くcurlのヘッダにtoken追加するのを忘れずに
 
 ## デプロイとフォルダwatchの開始
 
