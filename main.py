@@ -1,10 +1,17 @@
 import os
+import time
 import uuid
 import secrets
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, request, redirect, jsonify
+
+from flask import (
+    Flask,
+    request,
+    redirect,
+    jsonify,
+)
 
 from google.cloud import firestore
 from google.oauth2.credentials import Credentials
@@ -30,7 +37,8 @@ app = Flask(__name__)
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 
-# Firestoreにまだrefresh tokenが存在しない場合だけ使う
+# 初回移行用
+# Firestoreにrefresh_tokenが存在すればそちらを優先
 INITIAL_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
 
 TARGET_FOLDER_ID = os.environ["TARGET_FOLDER_ID"]
@@ -40,18 +48,17 @@ CHANNEL_TOKEN = os.environ["CHANNEL_TOKEN"]
 
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
 
-# /auth/start や /register-watch を誰でも呼べないようにする
+# 管理API用
 AUTH_SETUP_TOKEN = os.environ["AUTH_SETUP_TOKEN"]
-
+FIRESTOE_DB_NAME = os.environ["FIRESTOE_DB_NAME"]
 
 # ============================================================
-# OAuth Scope
+# OAuth Scopes
 # ============================================================
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/chat.messages.create",
-    "https://www.googleapis.com/auth/chat.messages.readonly"
 ]
 
 
@@ -59,78 +66,73 @@ SCOPES = [
 # Firestore
 # ============================================================
 
-# NOTE: databaseの名前をgcp上に実在するDBにすること. 
-
-db = firestore.Client(database="aob-db")
+db = firestore.Client(database=FIRESTOE_DB_NAME)
 
 
-# Drive changes の現在位置
+# DriveのpageToken + 現在のwatch情報
 DRIVE_STATE_DOCUMENT = (
     db.collection("drive_notifier")
     .document("state")
 )
 
 
-# refresh token保存先
+# refresh token
 OAUTH_TOKEN_DOCUMENT = (
     db.collection("oauth")
     .document("google")
 )
 
 
-# OAuth認証途中のstate / code_verifier保存先
-#
-# oauth_states
-#   └─ <state>
-#        └─ code_verifier: "..."
-#
-OAUTH_STATE_COLLECTION = db.collection("oauth_states")
+# OAuth PKCE途中状態
+OAUTH_STATE_COLLECTION = (
+    db.collection("oauth_states")
+)
+
+
+# Chatへまだ通知していないファイル
+PENDING_COLLECTION = (
+    db.collection("drive_pending_notifications")
+)
 
 
 # ============================================================
-# Refresh Token 管理
+# Refresh Token
 # ============================================================
 
 def save_refresh_token(refresh_token: str):
-    """
-    refresh tokenをFirestoreへ保存する。
-    """
-
     OAUTH_TOKEN_DOCUMENT.set(
         {
-            "refresh_token": refresh_token
+            "refresh_token": refresh_token,
         },
         merge=True,
     )
 
 
 def load_refresh_token() -> str:
-    """
-    Firestoreからrefresh tokenを取得する。
-
-    Firestoreにない場合のみ、
-    GOOGLE_REFRESH_TOKEN環境変数から初期移行する。
-    """
-
     snapshot = OAUTH_TOKEN_DOCUMENT.get()
 
     if snapshot.exists:
         data = snapshot.to_dict()
 
-        refresh_token = data.get("refresh_token")
+        refresh_token = data.get(
+            "refresh_token"
+        )
 
         if refresh_token:
             return refresh_token
 
     # 初回移行用
     if INITIAL_REFRESH_TOKEN:
-        save_refresh_token(INITIAL_REFRESH_TOKEN)
+        save_refresh_token(
+            INITIAL_REFRESH_TOKEN
+        )
 
         return INITIAL_REFRESH_TOKEN
 
     raise RuntimeError(
-        "Google refresh token が存在しません。"
-        f"{BASE_URL}/auth/start?token=... から再認証してください。"
+        "Google refresh token がありません。"
+        f"{BASE_URL}/auth/start?token=..."
+        " からOAuth認証してください。"
     )
 
 
@@ -139,34 +141,34 @@ def load_refresh_token() -> str:
 # ============================================================
 
 def get_google_credentials():
-    """
-    refresh tokenを使ってaccess tokenを取得する。
-    """
-
     refresh_token = load_refresh_token()
 
     credentials = Credentials(
         token=None,
         refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
+        token_uri=(
+            "https://oauth2.googleapis.com/token"
+        ),
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
         scopes=SCOPES,
     )
 
     try:
-        credentials.refresh(Request())
+        credentials.refresh(
+            Request()
+        )
 
     except RefreshError as e:
         print(
-            "Google OAuth refresh failed:",
+            "OAuth refresh failed:",
             repr(e),
         )
 
         raise RuntimeError(
-            "Google refresh token が失効しています。"
-            "OAuth再認証が必要です。\n"
-            f"{BASE_URL}/auth/start?token=AUTH_SETUP_TOKEN"
+            "refresh token が失効しています。"
+            f"{BASE_URL}/auth/start?token=..."
+            " から再認証してください。"
         ) from e
 
     return credentials
@@ -177,7 +179,9 @@ def get_google_credentials():
 # ============================================================
 
 def get_drive_service():
-    credentials = get_google_credentials()
+    credentials = (
+        get_google_credentials()
+    )
 
     return build(
         "drive",
@@ -187,11 +191,13 @@ def get_drive_service():
 
 
 # ============================================================
-# Google Chat API
+# Google Chat
 # ============================================================
 
 def send_chat(message: str):
-    credentials = get_google_credentials()
+    credentials = (
+        get_google_credentials()
+    )
 
     url = (
         "https://chat.googleapis.com/v1/"
@@ -201,19 +207,26 @@ def send_chat(message: str):
     response = requests.post(
         url,
         headers={
-            "Authorization": (
-                f"Bearer {credentials.token}"
-            ),
-            "Content-Type": "application/json",
+            "Authorization":
+                f"Bearer {credentials.token}",
+            "Content-Type":
+                "application/json",
         },
         json={
-            "text": message
+            "text": message,
         },
         timeout=10,
     )
 
-    print("Chat status:", response.status_code)
-    print("Chat response:", response.text)
+    print(
+        "Chat status:",
+        response.status_code,
+    )
+
+    print(
+        "Chat response:",
+        response.text,
+    )
 
     response.raise_for_status()
 
@@ -221,7 +234,7 @@ def send_chat(message: str):
 
 
 # ============================================================
-# OAuth Flow生成
+# OAuth Flow
 # ============================================================
 
 def create_oauth_flow(
@@ -229,22 +242,20 @@ def create_oauth_flow(
     state=None,
     code_verifier=None,
 ):
-    """
-    Google OAuth Flowを生成する。
-
-    code_verifierを渡すことでPKCEを利用する。
-    """
-
     client_config = {
         "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": (
-                "https://accounts.google.com/o/oauth2/auth"
-            ),
-            "token_uri": (
-                "https://oauth2.googleapis.com/token"
-            ),
+            "client_id":
+                GOOGLE_CLIENT_ID,
+
+            "client_secret":
+                GOOGLE_CLIENT_SECRET,
+
+            "auth_uri":
+                "https://accounts.google.com/o/oauth2/auth",
+
+            "token_uri":
+                "https://oauth2.googleapis.com/token",
+
             "redirect_uris": [
                 f"{BASE_URL}/auth/callback"
             ],
@@ -266,269 +277,49 @@ def create_oauth_flow(
 
 
 # ============================================================
-# Health Check
+# TARGET_DIR配下判定
 # ============================================================
 
-@app.get("/")
-def hello():
-    return "Drive notifier is running"
-
-
-# ============================================================
-# OAuth状態確認
-# ============================================================
-
-@app.get("/auth/status")
-def auth_status():
+def is_under_target_folder(
+    drive,
+    parent_ids,
+    parent_cache,
+):
     """
-    refresh tokenが保存されているかだけ確認する。
+    ファイルの親を上へ辿り、
+    TARGET_FOLDER_IDが祖先に存在するか確認。
 
-    refresh tokenそのものは返さない。
+    parent_cacheを使って、
+    同じフォルダに対するDrive API呼び出しを減らす。
     """
 
-    snapshot = OAUTH_TOKEN_DOCUMENT.get()
-
-    exists = False
-
-    if snapshot.exists:
-        exists = bool(
-            snapshot.to_dict().get(
-                "refresh_token"
-            )
-        )
-
-    return jsonify({
-        "refresh_token_exists": exists
-    })
-
-
-# ============================================================
-# OAuth開始
-# ============================================================
-
-@app.get("/auth/start")
-def auth_start():
-    """
-    OAuth認証を開始する。
-
-    例:
-    /auth/start?token=xxxxxxxx
-    """
-
-    admin_token = request.args.get("token")
-
-    if admin_token != AUTH_SETUP_TOKEN:
-        return "unauthorized", 401
-
-    # --------------------------------------------------------
-    # PKCE用の秘密値
-    #
-    # Googleにはこの値そのものではなく
-    # SHA256した code_challenge が送られる。
-    # --------------------------------------------------------
-
-    code_verifier = secrets.token_urlsafe(64)
-
-    flow = create_oauth_flow(
-        code_verifier=code_verifier,
-    )
-
-    authorization_url, state = (
-        flow.authorization_url(
-            access_type="offline",
-
-            # refresh tokenを再発行させる
-            prompt="consent",
-
-            include_granted_scopes="true",
-        )
-    )
-
-    # --------------------------------------------------------
-    # callbackで必要になるので保存する
-    #
-    # stateごとにドキュメントを分けることで
-    # 複数リクエストでも衝突しにくくする
-    # --------------------------------------------------------
-
-    OAUTH_STATE_COLLECTION.document(
-        state
-    ).set({
-        "code_verifier": code_verifier
-    })
-
-    print(
-        f"OAuth started. state={state}"
-    )
-
-    return redirect(authorization_url)
-
-
-# ============================================================
-# OAuth Callback
-# ============================================================
-
-@app.get("/auth/callback")
-def auth_callback():
-    """
-    Googleログイン後にGoogleから呼ばれる。
-
-    authorization code + code_verifier
-          ↓
-    access token / refresh token
-    """
-
-    callback_state = request.args.get(
-        "state"
-    )
-
-    authorization_code = request.args.get(
-        "code"
-    )
-
-    oauth_error = request.args.get(
-        "error"
-    )
-
-    # Google側で拒否された場合
-    if oauth_error:
-        return jsonify({
-            "error": oauth_error
-        }), 400
-
-    if not callback_state:
-        return "state missing", 400
-
-    if not authorization_code:
-        return "authorization code missing", 400
-
-    # --------------------------------------------------------
-    # /auth/start時に保存したcode_verifierを取得
-    # --------------------------------------------------------
-
-    state_document = (
-        OAUTH_STATE_COLLECTION
-        .document(callback_state)
-    )
-
-    state_snapshot = state_document.get()
-
-    if not state_snapshot.exists:
-        return (
-            "OAuth state not found. "
-            "Please restart OAuth flow.",
-            400,
-        )
-
-    state_data = state_snapshot.to_dict()
-
-    code_verifier = state_data.get(
-        "code_verifier"
-    )
-
-    if not code_verifier:
-        return (
-            "PKCE code_verifier not found.",
-            400,
-        )
-
-    # --------------------------------------------------------
-    # 同じstate / code_verifierでFlowを復元
-    # --------------------------------------------------------
-
-    flow = create_oauth_flow(
-        state=callback_state,
-        code_verifier=code_verifier,
-    )
-
-    try:
-        # authorization code
-        # +
-        # PKCE code verifier
-        #
-        # をGoogleのToken Endpointへ送る
-        flow.fetch_token(
-            code=authorization_code
-        )
-
-    except Exception as e:
-        print(
-            "OAuth token exchange failed:",
-            repr(e),
-        )
-
-        return jsonify({
-            "error": "OAuth token exchange failed",
-            "detail": str(e),
-        }), 500
-
-    credentials = flow.credentials
-
-    refresh_token = credentials.refresh_token
-
-    if not refresh_token:
-        return jsonify({
-            "error": (
-                "Google did not return "
-                "a refresh token."
-            )
-        }), 500
-
-    # --------------------------------------------------------
-    # 新refresh tokenをFirestoreへ保存
-    # --------------------------------------------------------
-
-    save_refresh_token(
-        refresh_token
-    )
-
-    # PKCE verifierは一回使ったら不要
-    state_document.delete()
-
-    print(
-        "New Google refresh token stored."
-    )
-
-    return (
-        "Google OAuth authentication completed. "
-        "New refresh token has been saved."
-    )
-
-
-# ============================================================
-# Drive Watch登録
-# ============================================================
-
-def is_under_target_folder(drive, parent_ids):
-    """
-    parent_ids から親フォルダを上へ辿り、
-    TARGET_FOLDER_ID が祖先に存在するか確認する。
-
-    例:
-        TARGET_DIR
-          └── live
-                └── 2026
-                      └── song.pdf
-
-    song.pdf の直接の親が 2026 でも、
-    祖先に TARGET_DIR があれば True。
-    """
-
-    visited = set()
     queue = list(parent_ids)
 
+    visited = set()
+
     while queue:
+
         folder_id = queue.pop()
 
-        # 監視対象フォルダに到達
+        # TARGET_DIRに到達
         if folder_id == TARGET_FOLDER_ID:
             return True
 
-        # 同じフォルダを何度も調べない
         if folder_id in visited:
             continue
 
         visited.add(folder_id)
+
+        # キャッシュあり
+        if folder_id in parent_cache:
+
+            queue.extend(
+                parent_cache[
+                    folder_id
+                ]
+            )
+
+            continue
 
         try:
             folder = (
@@ -543,85 +334,453 @@ def is_under_target_folder(drive, parent_ids):
 
         except Exception as e:
             print(
-                f"Failed to get parent folder "
-                f"{folder_id}: {repr(e)}"
+                "Failed to get parent:",
+                folder_id,
+                repr(e),
             )
+
+            parent_cache[
+                folder_id
+            ] = []
+
             continue
 
-        parent_folders = folder.get(
+        parents = folder.get(
             "parents",
             [],
         )
 
-        queue.extend(parent_folders)
+        parent_cache[
+            folder_id
+        ] = parents
+
+        queue.extend(
+            parents
+        )
 
     return False
 
 
-@app.post("/register-watch")
-def register_watch():
-    """
-    Drive changes.watch を登録する。
+# ============================================================
+# Pending notification
+# ============================================================
 
-    X-Admin-Token:
-        AUTH_SETUP_TOKEN
+def add_pending_file(file_data):
+    """
+    通知待ちファイルをFirestoreに保存。
+
+    document IDをfile_idにすることで、
+    同じファイルへの連続変更は1件にまとめる。
     """
 
-    admin_token = request.headers.get(
-        "X-Admin-Token"
+    file_id = file_data["id"]
+
+    PENDING_COLLECTION.document(
+        file_id
+    ).set(
+        {
+            "file_id": file_id,
+
+            "name":
+                file_data.get(
+                    "name",
+                    "(unknown)",
+                ),
+
+            "url":
+                file_data.get(
+                    "webViewLink",
+                    "",
+                ),
+
+            "updated_at":
+                firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
     )
 
-    if admin_token != AUTH_SETUP_TOKEN:
+
+# ============================================================
+# Health Check
+# ============================================================
+
+@app.get("/")
+def hello():
+    return {
+        "status": "ok",
+        "service": "TARGET_DIR Drive notifier",
+    }
+
+
+# ============================================================
+# OAuth Status
+# ============================================================
+
+@app.get("/auth/status")
+def auth_status():
+    snapshot = (
+        OAUTH_TOKEN_DOCUMENT.get()
+    )
+
+    exists = False
+
+    if snapshot.exists:
+        exists = bool(
+            snapshot
+            .to_dict()
+            .get("refresh_token")
+        )
+
+    return jsonify({
+        "refresh_token_exists":
+            exists
+    })
+
+
+# ============================================================
+# OAuth Start
+# ============================================================
+
+@app.get("/auth/start")
+def auth_start():
+
+    admin_token = (
+        request.args.get("token")
+    )
+
+    if (
+        admin_token
+        != AUTH_SETUP_TOKEN
+    ):
+        return "unauthorized", 401
+
+    # PKCE
+    code_verifier = (
+        secrets.token_urlsafe(64)
+    )
+
+    flow = create_oauth_flow(
+        code_verifier=code_verifier,
+    )
+
+    authorization_url, state = (
+        flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            include_granted_scopes="true",
+        )
+    )
+
+    # Callbackで復元する
+    OAUTH_STATE_COLLECTION.document(
+        state
+    ).set({
+        "code_verifier":
+            code_verifier,
+    })
+
+    return redirect(
+        authorization_url
+    )
+
+
+# ============================================================
+# OAuth Callback
+# ============================================================
+
+@app.get("/auth/callback")
+def auth_callback():
+
+    callback_state = (
+        request.args.get("state")
+    )
+
+    authorization_code = (
+        request.args.get("code")
+    )
+
+    oauth_error = (
+        request.args.get("error")
+    )
+
+    if oauth_error:
+        return jsonify({
+            "error": oauth_error
+        }), 400
+
+    if not callback_state:
+        return "state missing", 400
+
+    if not authorization_code:
+        return (
+            "authorization code missing",
+            400,
+        )
+
+    state_document = (
+        OAUTH_STATE_COLLECTION
+        .document(callback_state)
+    )
+
+    snapshot = (
+        state_document.get()
+    )
+
+    if not snapshot.exists:
+        return (
+            "OAuth state not found",
+            400,
+        )
+
+    data = snapshot.to_dict()
+
+    code_verifier = (
+        data.get("code_verifier")
+    )
+
+    if not code_verifier:
+        return (
+            "code_verifier missing",
+            400,
+        )
+
+    flow = create_oauth_flow(
+        state=callback_state,
+        code_verifier=code_verifier,
+    )
+
+    try:
+        flow.fetch_token(
+            code=authorization_code
+        )
+
+    except Exception as e:
+        print(
+            "OAuth token exchange failed:",
+            repr(e),
+        )
+
+        return jsonify({
+            "error":
+                "OAuth token exchange failed",
+
+            "detail":
+                str(e),
+        }), 500
+
+    credentials = (
+        flow.credentials
+    )
+
+    refresh_token = (
+        credentials.refresh_token
+    )
+
+    if not refresh_token:
+        return (
+            "refresh token not returned",
+            500,
+        )
+
+    save_refresh_token(
+        refresh_token
+    )
+
+    # PKCEの一時情報削除
+    state_document.delete()
+
+    return (
+        "OAuth completed. "
+        "Refresh token saved."
+    )
+
+
+# ============================================================
+# Drive Watch登録
+# ============================================================
+
+@app.post("/register-watch")
+def register_watch():
+
+    admin_token = (
+        request.headers.get(
+            "X-Admin-Token"
+        )
+    )
+
+    if (
+        admin_token
+        != AUTH_SETUP_TOKEN
+    ):
         return "unauthorized", 401
 
     drive = get_drive_service()
 
-    # --------------------------------------------------------
-    # 現在のDrive変更履歴の位置を取得
-    # --------------------------------------------------------
-
-    start_page_token = (
-        drive.changes()
-        .getStartPageToken()
-        .execute()["startPageToken"]
+    state_snapshot = (
+        DRIVE_STATE_DOCUMENT.get()
     )
 
-    DRIVE_STATE_DOCUMENT.set({
-        "page_token": start_page_token
-    })
+    state_data = {}
+
+    if state_snapshot.exists:
+        state_data = (
+            state_snapshot.to_dict()
+        )
+
+    old_channel_id = (
+        state_data.get(
+            "channel_id"
+        )
+    )
+
+    old_resource_id = (
+        state_data.get(
+            "resource_id"
+        )
+    )
+
+    page_token = (
+        state_data.get(
+            "page_token"
+        )
+    )
+
+    # ========================================================
+    # 古いwatchを停止
+    # ========================================================
+
+    if (
+        old_channel_id
+        and old_resource_id
+    ):
+
+        try:
+            (
+                drive.channels()
+                .stop(
+                    body={
+                        "id":
+                            old_channel_id,
+
+                        "resourceId":
+                            old_resource_id,
+                    }
+                )
+                .execute()
+            )
+
+            print(
+                "Old watch stopped:",
+                old_channel_id,
+            )
+
+        except Exception as e:
+            # 期限切れ済みでも新watchは作る
+            print(
+                "Could not stop old watch:",
+                repr(e),
+            )
+
+    # ========================================================
+    # 初回だけpage token取得
+    # ========================================================
+
+    if not page_token:
+
+        page_token = (
+            drive.changes()
+            .getStartPageToken()
+            .execute()[
+                "startPageToken"
+            ]
+        )
+
+    # ========================================================
+    # 新watch
+    # ========================================================
 
     channel_id = str(
         uuid.uuid4()
     )
 
-    # --------------------------------------------------------
-    # Driveに
-    #
-    # 「変更があったら /drive-webhook を呼んで」
-    #
-    # と登録
-    # --------------------------------------------------------
+    # 6日間
+    expiration_ms = int(
+        (
+            time.time()
+            + 6 * 24 * 60 * 60
+        )
+        * 1000
+    )
 
     result = (
         drive.changes()
         .watch(
-            pageToken=start_page_token,
+            pageToken=page_token,
             body={
-                "id": channel_id,
-                "type": "web_hook",
-                "address": (
-                    f"{BASE_URL}/drive-webhook"
-                ),
-                "token": CHANNEL_TOKEN,
+                "id":
+                    channel_id,
+
+                "type":
+                    "web_hook",
+
+                "address":
+                    f"{BASE_URL}/drive-webhook",
+
+                "token":
+                    CHANNEL_TOKEN,
+
+                "expiration":
+                    str(expiration_ms),
             },
         )
         .execute()
     )
 
+    resource_id = (
+        result.get(
+            "resourceId"
+        )
+    )
+
+    expiration = (
+        result.get(
+            "expiration"
+        )
+    )
+
+    # ========================================================
+    # 現行watchを保存
+    # ========================================================
+
+    DRIVE_STATE_DOCUMENT.set(
+        {
+            "page_token":
+                page_token,
+
+            "channel_id":
+                channel_id,
+
+            "resource_id":
+                resource_id,
+
+            "expiration":
+                expiration,
+        },
+        merge=True,
+    )
+
     return jsonify({
-        "message": "watch registered",
-        "channel_id": channel_id,
-        "result": result,
+        "message":
+            "watch registered",
+
+        "channel_id":
+            channel_id,
+
+        "resource_id":
+            resource_id,
+
+        "expiration":
+            expiration,
     })
 
 
@@ -632,26 +791,34 @@ def register_watch():
 @app.post("/drive-webhook")
 def drive_webhook():
 
-    print("Drive webhook received")
-
-    # ========================================================
-    # 1. Channel Token確認
-    # ========================================================
-
-    received_token = request.headers.get(
-        "X-Goog-Channel-Token"
+    print(
+        "Drive webhook received"
     )
 
-    if received_token != CHANNEL_TOKEN:
+    # ========================================================
+    # Channel Token
+    # ========================================================
+
+    received_token = (
+        request.headers.get(
+            "X-Goog-Channel-Token"
+        )
+    )
+
+    if (
+        received_token
+        != CHANNEL_TOKEN
+    ):
 
         print(
-            "Invalid channel token"
+            "Ignoring invalid channel token"
         )
 
+        # Googleに再試行させない
         return "", 204
 
     # ========================================================
-    # 2. Channel ID確認
+    # Channel ID
     # ========================================================
 
     received_channel_id = (
@@ -661,17 +828,19 @@ def drive_webhook():
     )
 
     state = (
-        DRIVE_STATE_DOCUMENT
-        .get()
+        DRIVE_STATE_DOCUMENT.get()
     )
 
     if not state.exists:
         print(
-            "Drive state not found"
+            "Drive state missing"
         )
+
         return "", 204
 
-    state_data = state.to_dict()
+    state_data = (
+        state.to_dict()
+    )
 
     active_channel_id = (
         state_data.get(
@@ -679,8 +848,7 @@ def drive_webhook():
         )
     )
 
-    # 古いwatchから来た通知なら
-    # Drive APIすら叩かず終了する
+    # 古いwatchから来た通知
     if (
         active_channel_id
         and received_channel_id
@@ -688,33 +856,36 @@ def drive_webhook():
     ):
 
         print(
-            "Ignoring old Drive channel:",
+            "Ignoring old channel:",
             received_channel_id,
-            "active:",
-            active_channel_id,
         )
 
+        # Drive APIを叩かない
         return "", 204
 
-    # ========================================================
-    # ここから本来の処理
-    # ========================================================
-
-    page_token = state_data.get(
-        "page_token"
+    page_token = (
+        state_data.get(
+            "page_token"
+        )
     )
 
     if not page_token:
         print(
-            "Drive page token not found"
+            "page_token missing"
         )
+
         return "", 204
+
+    # ========================================================
+    # ここから初めてDrive APIを使う
+    # ========================================================
 
     drive = get_drive_service()
 
-    # ========================================================
-    # Drive変更履歴を取得
-    # ========================================================
+    # 同じWebhook内で親フォルダ検索をキャッシュ
+    parent_cache = {}
+
+    detected_count = 0
 
     while page_token:
 
@@ -742,170 +913,281 @@ def drive_webhook():
             .execute()
         )
 
-        changes = result.get(
-            "changes",
-            [],
+        changes = (
+            result.get(
+                "changes",
+                [],
+            )
         )
-
-        # ====================================================
-        # 変更されたファイルを1件ずつ確認
-        # ====================================================
 
         for change in changes:
 
-            # 削除されたファイルは通知しない
-            if change.get("removed"):
+            # 削除は無視
+            if change.get(
+                "removed"
+            ):
                 continue
 
-            file_data = change.get(
-                "file"
+            file_data = (
+                change.get("file")
             )
 
             if not file_data:
                 continue
 
-            file_id = file_data.get(
-                "id"
-            )
-
-            name = file_data.get(
-                "name",
-                "(unknown)"
-            )
-
-            mime_type = file_data.get(
-                "mimeType",
-                ""
-            )
-
-            parents = file_data.get(
-                "parents",
-                [],
-            )
-
-            url = file_data.get(
-                "webViewLink",
-                "",
-            )
-
-            # =================================================
-            # フォルダ自身の変更は通知しない
-            # =================================================
-
+            # フォルダ自体の変更は通知しない
             if (
-                mime_type
-                == "application/vnd.google-apps.folder"
-            ):
-                print(
-                    f"Skip folder change: {name}"
+                file_data.get(
+                    "mimeType"
                 )
+                ==
+                "application/vnd.google-apps.folder"
+            ):
                 continue
 
+            parents = (
+                file_data.get(
+                    "parents",
+                    [],
+                )
+            )
+
             # =================================================
-            # TARGET_DIR配下か確認
-            #
-            # 直接の親だけでなく、
-            # 親 → 親 → 親...
-            # と上へ辿る。
+            # TARGET_DIR配下か？
             # =================================================
 
             if not is_under_target_folder(
                 drive,
                 parents,
+                parent_cache,
             ):
-                print(
-                    f"Skip outside target folder: "
-                    f"{name}"
-                )
                 continue
 
-            # =================================================
-            # 対象ファイル
-            # =================================================
-
             print(
-                f"Detected target file: "
-                f"{name} ({file_id})"
+                "Detected:",
+                file_data.get("name"),
             )
 
             # =================================================
-            # Google Chatへ通知
+            # ★ ここではChatへ送らない
+            #
+            # Firestoreに通知待ちとして保存するだけ
             # =================================================
 
-            message = (
-                "📁 Google Driveに"
-                "ファイルが追加・変更されました\n"
-                f"{name}\n"
-                f"{url}"
+            add_pending_file(
+                file_data
             )
 
-            try:
-                send_chat(message)
+            detected_count += 1
 
-            except Exception as e:
-                print(
-                    f"Failed to send Chat message: "
-                    f"{repr(e)}"
-                )
-
-                # Chat送信失敗を握り潰したくないなら
-                # raise に変更してもOK
-                raise
-
-        # ====================================================
-        # changes.list のページング
-        # ====================================================
-
-        next_page_token = result.get(
-            "nextPageToken"
+        next_page_token = (
+            result.get(
+                "nextPageToken"
+            )
         )
 
         if next_page_token:
-            page_token = next_page_token
+
+            page_token = (
+                next_page_token
+            )
+
             continue
 
-        # ====================================================
-        # 全変更を読み終えたので、
-        # 次回用のpage tokenを保存
-        # ====================================================
-
-        new_start_page_token = result.get(
-            "newStartPageToken"
+        new_token = (
+            result.get(
+                "newStartPageToken"
+            )
         )
 
-        if new_start_page_token:
-            DRIVE_STATE_DOCUMENT.set({
-                "page_token":
-                    new_start_page_token
-            })
+        if new_token:
+
+            DRIVE_STATE_DOCUMENT.set(
+                {
+                    "page_token":
+                        new_token
+                },
+                merge=True,
+            )
 
         break
+
+    print(
+        "Pending files added:",
+        detected_count,
+    )
 
     return "", 204
 
 
-@app.get("/chat-space-test")
-def chat_space_test():
-    credentials = get_google_credentials()
+# ============================================================
+# 通知バッチ送信
+# ============================================================
 
-    url = (
-        "https://chat.googleapis.com/v1/"
-        f"spaces/{CHAT_SPACE_ID}/messages"
+@app.post("/flush-notifications")
+def flush_notifications():
+    """
+    Cloud Schedulerから10分ごとに呼ぶ。
+
+    Firestoreに溜まっているファイルを
+    まとめてGoogle Chatへ1通送る。
+    """
+
+    admin_token = (
+        request.headers.get(
+            "X-Admin-Token"
+        )
     )
 
-    response = requests.get(
-        url,
-        headers={
-            "Authorization": (
-                f"Bearer {credentials.token}"
+    if (
+        admin_token
+        != AUTH_SETUP_TOKEN
+    ):
+        return "unauthorized", 401
+
+    # ========================================================
+    # pending取得
+    # ========================================================
+
+    documents = list(
+        PENDING_COLLECTION.stream()
+    )
+
+    if not documents:
+
+        print(
+            "No pending notifications"
+        )
+
+        return jsonify({
+            "message":
+                "nothing to notify",
+
+            "count":
+                0,
+        })
+
+    files = []
+
+    for document in documents:
+
+        data = (
+            document.to_dict()
+        )
+
+        files.append({
+            "id":
+                document.id,
+
+            "name":
+                data.get(
+                    "name",
+                    "(unknown)",
+                ),
+
+            "url":
+                data.get(
+                    "url",
+                    "",
+                ),
+        })
+
+    # 名前順
+    files.sort(
+        key=lambda x:
+            x["name"].lower()
+    )
+
+    total = len(files)
+
+    # Chatを巨大化させない
+    max_display = 30
+
+    visible_files = (
+        files[:max_display]
+    )
+
+    lines = [
+        (
+            "📁 Google Driveに"
+            f"{total}件のファイル変更があります"
+        ),
+        "",
+    ]
+
+    for file_data in visible_files:
+
+        name = file_data["name"]
+        url = file_data["url"]
+
+        if url:
+            lines.append(
+                f"・{name}\n  {url}"
             )
-        },
-        timeout=10,
+        else:
+            lines.append(
+                f"・{name}"
+            )
+
+    if total > max_display:
+
+        remaining = (
+            total - max_display
+        )
+
+        lines.append("")
+        lines.append(
+            f"ほか {remaining} 件"
+        )
+
+    message = "\n".join(
+        lines
     )
 
-    return (
-        response.text,
-        response.status_code,
-        {"Content-Type": "application/json"},
+    # ========================================================
+    # Chat送信
+    #
+    # 成功するまでFirestoreから消さない
+    # ========================================================
+
+    send_chat(
+        message
     )
 
+    # ========================================================
+    # 送信成功後にpending削除
+    # ========================================================
+
+    # Firestore batchは最大500 writesなので
+    # 400件ずつ処理
+    for start in range(
+        0,
+        len(documents),
+        400,
+    ):
+
+        batch = db.batch()
+
+        chunk = documents[
+            start:start + 400
+        ]
+
+        for document in chunk:
+            batch.delete(
+                document.reference
+            )
+
+        batch.commit()
+
+    print(
+        "Notification batch sent:",
+        total,
+    )
+
+    return jsonify({
+        "message":
+            "notification sent",
+
+        "count":
+            total,
+    })
