@@ -2,7 +2,7 @@
 
 - Google Driveの特定のディレクトリの変更をGoogle Chatに通知するリポジトリ
 
-# 使い方
+## 使い方
 
 1. GCPを始める
 1. 有効なAPIサービスとしてgoogle chat apiとgoogle drive apiを追加
@@ -12,7 +12,7 @@
 1. OAthでそれぞれのAPI叩くんでOathクライアントの追加も忘れずに
 1. あとFirestore(GCP上のNoSQL DB)も始めてください・・。DBの名前をソース上でべた書きで指定するのでそれを直してください。今aob-dbとかになってます
 
-# デプロイとフォルダwatchの開始
+## デプロイとフォルダwatchの開始
 
 - アクセストークン取得したい場合は/auth/startを叩く
 
