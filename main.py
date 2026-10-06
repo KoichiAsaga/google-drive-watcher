@@ -3,6 +3,8 @@ import time
 import uuid
 import secrets
 
+from datetime import datetime
+
 import requests
 from dotenv import load_dotenv
 
@@ -60,6 +62,82 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/chat.messages.create",
 ]
+
+
+# ============================================================
+# 変更検知スコープ（data駆動）
+# ============================================================
+
+# Driveフォルダ自体のmimeType
+FOLDER_MIME_TYPE = (
+    "application/vnd.google-apps.folder"
+)
+
+# 変更種別のラベル（Chat通知の表示用）
+CHANGE_KIND_LABELS = {
+    "added": "新規",
+    "modified": "更新",
+    "trashed": "ゴミ箱",
+    "removed": "削除",
+}
+
+# どのプリセットがどの変更種別を通知対象にするか。
+# 種別: added(新規作成) / modified(既存更新)
+#       / trashed(ゴミ箱移動) / removed(削除・アクセス喪失)
+#
+# 環境変数 CHANGE_SCOPE でこの中から1つ選ぶ。
+# ここに1行足すだけで新しいパターンを増やせる。
+CHANGE_SCOPE_PRESETS = {
+    # 新規追加のみ（デフォルト）
+    "added_only": {
+        "added",
+    },
+
+    # 追加 + 既存ファイルの更新
+    "added_and_modified": {
+        "added",
+        "modified",
+    },
+
+    # 追加 + 更新 + ゴミ箱移動
+    "added_modified_trashed": {
+        "added",
+        "modified",
+        "trashed",
+    },
+
+    # すべての変更（削除・アクセス喪失も含む）
+    # ※ removed は file 情報が無く親も辿れないため
+    #   TARGET_FOLDER_ID 配下かどうかの判定ができない点に注意。
+    "all": {
+        "added",
+        "modified",
+        "trashed",
+        "removed",
+    },
+}
+
+CHANGE_SCOPE = os.getenv(
+    "CHANGE_SCOPE",
+    "added_only",
+).strip()
+
+if CHANGE_SCOPE not in CHANGE_SCOPE_PRESETS:
+    raise RuntimeError(
+        f"CHANGE_SCOPE='{CHANGE_SCOPE}' は不正です。"
+        "次のいずれかを指定してください: "
+        f"{', '.join(CHANGE_SCOPE_PRESETS)}"
+    )
+
+# 実際に通知対象とする変更種別の集合
+ACTIVE_CHANGE_KINDS = (
+    CHANGE_SCOPE_PRESETS[CHANGE_SCOPE]
+)
+
+# 作成直後は createdTime と modifiedTime が
+# ほぼ同時刻になることを利用して「追加」を判定する。
+# アップロード方式による僅かなズレを吸収するための許容秒数。
+ADDED_TIME_TOLERANCE_SECONDS = 2
 
 
 # ============================================================
@@ -362,10 +440,83 @@ def is_under_target_folder(
 
 
 # ============================================================
+# 変更種別の判定
+# ============================================================
+
+def _parse_rfc3339(value):
+    """
+    DriveのRFC3339タイムスタンプ文字列をdatetimeに。
+    パースできなければNone。
+    """
+
+    if not value:
+        return None
+
+    try:
+        # 末尾 'Z' を +00:00 に変換して解釈
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+
+    except ValueError:
+        return None
+
+
+def classify_change(change):
+    """
+    Driveのchangeを変更種別に分類する。
+
+    戻り値:
+      "added"    新規作成
+      "modified" 既存ファイルの更新
+      "trashed"  ゴミ箱へ移動
+      "removed"  削除 / アクセス喪失（file情報なし）
+      None       分類不能（通知対象外）
+    """
+
+    # file情報が無い = 削除 / アクセス喪失
+    if change.get("removed"):
+        return "removed"
+
+    file_data = change.get("file")
+
+    if not file_data:
+        return None
+
+    # ゴミ箱移動
+    if file_data.get("trashed"):
+        return "trashed"
+
+    created = _parse_rfc3339(
+        file_data.get("createdTime")
+    )
+
+    modified = _parse_rfc3339(
+        file_data.get("modifiedTime")
+    )
+
+    # 作成直後は created ≒ modified → 新規追加とみなす
+    if created and modified:
+
+        delta = abs(
+            (modified - created)
+            .total_seconds()
+        )
+
+        if (
+            delta
+            <= ADDED_TIME_TOLERANCE_SECONDS
+        ):
+            return "added"
+
+    return "modified"
+
+
+# ============================================================
 # Pending notification
 # ============================================================
 
-def add_pending_file(file_data):
+def add_pending_file(file_data, kind):
     """
     通知待ちファイルをFirestoreに保存。
 
@@ -392,6 +543,8 @@ def add_pending_file(file_data):
                     "webViewLink",
                     "",
                 ),
+
+            "kind": kind,
 
             "updated_at":
                 firestore.SERVER_TIMESTAMP,
@@ -905,6 +1058,9 @@ def drive_webhook():
                     "name,"
                     "parents,"
                     "mimeType,"
+                    "trashed,"
+                    "createdTime,"
+                    "modifiedTime,"
                     "webViewLink"
                     ")"
                     ")"
@@ -922,10 +1078,41 @@ def drive_webhook():
 
         for change in changes:
 
-            # 削除は無視
-            if change.get(
-                "removed"
+            # =================================================
+            # 変更種別を判定し、スコープ外なら無視
+            # （CHANGE_SCOPE プリセットで制御）
+            # =================================================
+
+            kind = classify_change(
+                change
+            )
+
+            if (
+                kind
+                not in ACTIVE_CHANGE_KINDS
             ):
+                continue
+
+            # =================================================
+            # removed は file 情報・親が無く
+            # フォルダ配下判定ができないため、そのまま記録
+            # （CHANGE_SCOPE=all のときだけここに来る）
+            # =================================================
+
+            if kind == "removed":
+
+                add_pending_file(
+                    {
+                        "id":
+                            change.get(
+                                "fileId"
+                            ),
+                    },
+                    kind,
+                )
+
+                detected_count += 1
+
                 continue
 
             file_data = (
@@ -940,8 +1127,7 @@ def drive_webhook():
                 file_data.get(
                     "mimeType"
                 )
-                ==
-                "application/vnd.google-apps.folder"
+                == FOLDER_MIME_TYPE
             ):
                 continue
 
@@ -965,6 +1151,7 @@ def drive_webhook():
 
             print(
                 "Detected:",
+                kind,
                 file_data.get("name"),
             )
 
@@ -975,7 +1162,8 @@ def drive_webhook():
             # =================================================
 
             add_pending_file(
-                file_data
+                file_data,
+                kind,
             )
 
             detected_count += 1
@@ -1090,6 +1278,11 @@ def flush_notifications():
                     "url",
                     "",
                 ),
+
+            "kind":
+                data.get(
+                    "kind"
+                ),
         })
 
     # 名前順
@@ -1120,13 +1313,24 @@ def flush_notifications():
         name = file_data["name"]
         url = file_data["url"]
 
+        # 変更種別ラベル（複数種別を扱うので区別する）
+        label = CHANGE_KIND_LABELS.get(
+            file_data.get("kind")
+        )
+
+        prefix = (
+            f"[{label}] "
+            if label
+            else ""
+        )
+
         if url:
             lines.append(
-                f"・{name}\n  {url}"
+                f"・{prefix}{name}\n  {url}"
             )
         else:
             lines.append(
-                f"・{name}"
+                f"・{prefix}{name}"
             )
 
     if total > max_display:
