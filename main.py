@@ -1091,6 +1091,7 @@ def drive_webhook():
                 kind
                 not in ACTIVE_CHANGE_KINDS
             ):
+                print("this change will not be notified.", kind)
                 continue
 
             # =================================================

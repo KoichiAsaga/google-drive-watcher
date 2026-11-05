@@ -1,2 +1,13 @@
+# secrets
 .env
+.env.*
 
+# python
+__pycache__/
+*.pyc
+
+# virtualenv (作成先がプロジェクト直下のため)
+/Lib/
+/Scripts/
+/Include/
+/pyvenv.cfg
